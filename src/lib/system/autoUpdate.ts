@@ -28,12 +28,35 @@ export function isValidPackageMarker(dir: string): boolean {
   }
 }
 
+/**
+ * Turbopack (Next.js 16 server bundles) does not preserve `__dirname`: it inlines a build-time
+ * placeholder rooted at `/ROOT/` (e.g. `"/ROOT/src/lib/system"`) instead of the real on-disk
+ * directory. Walking up from that path finds nothing, so `PROJECT_ROOT` used to fall back to
+ * `$HOME` — and when `$HOME/.git` exists (a `bd init`, a dotfiles repo) a global npm install was
+ * misclassified as a *source checkout* and the updater ran `git fetch --tags origin` in the home
+ * directory (`fatal: 'origin' does not appear to be a git repository`).
+ *
+ * When the start dir is missing or is that placeholder, the server's cwd (`dist/` for the npm
+ * package, the repo root for a checkout) is the trustworthy anchor instead.
+ *
+ * @internal — exported for testability.
+ */
+export function isBundledDirnamePlaceholder(dir: string | undefined): boolean {
+  if (!dir) return true;
+  return /^[/\\]ROOT([/\\]|$)/.test(dir);
+}
+
+function moduleDirname(): string | undefined {
+  return typeof __dirname !== "undefined" ? __dirname : undefined;
+}
+
 /** @internal — exported for testability. */
 export function resolveProjectRoot(
   fallback: string,
-  startDir: string = typeof __dirname !== "undefined" ? __dirname : process.cwd()
+  startDir: string | undefined = moduleDirname(),
+  cwd: string = process.cwd()
 ): string {
-  let dir = path.resolve(startDir);
+  let dir = path.resolve(isBundledDirnamePlaceholder(startDir) ? cwd : startDir);
   while (true) {
     if (existsSync(path.join(dir, ".git"))) return dir;
     if (existsSync(path.join(dir, "package.json")) && isValidPackageMarker(dir)) return dir;
@@ -42,6 +65,17 @@ export function resolveProjectRoot(
     dir = parent;
   }
   return fallback;
+}
+
+/**
+ * A directory is an OmniRoute *source checkout* only when it is a git worktree (`.git` dir or
+ * worktree file) AND carries the project `package.json`. A bare `.git` (e.g. `$HOME` under a
+ * dotfiles/`bd init` repo reached through the fallback) is not a checkout the updater may drive.
+ *
+ * @internal — exported for testability.
+ */
+export function isSourceCheckout(dir: string): boolean {
+  return existsSync(path.join(dir, ".git")) && isValidPackageMarker(dir);
 }
 
 const FALLBACK_CWD = process.env.HOME || homedir() || "/tmp";
@@ -140,15 +174,22 @@ function parsePatchCommits(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export function getAutoUpdateConfig(env: NodeJS.ProcessEnv = process.env): AutoUpdateConfig {
+export function getAutoUpdateConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  location: { projectRoot?: string; currentDir?: string } = {}
+): AutoUpdateConfig {
   const dataDir = env.DATA_DIR || "/tmp/omniroute";
   const repoDir = env.AUTO_UPDATE_REPO_DIR || "/workspace/omniroute";
 
   let mode = normalizeMode(env.AUTO_UPDATE_MODE);
   if (mode === "npm") {
-    const isGitRepo = existsSync(path.join(PROJECT_ROOT, ".git"));
-    const currentDir = typeof __dirname !== "undefined" ? __dirname : PROJECT_ROOT;
-    mode = resolveAutoUpdateMode(mode, { isGitRepo, currentDir });
+    const projectRoot = location.projectRoot ?? PROJECT_ROOT;
+    // In the bundled server `__dirname` is a Turbopack placeholder (see
+    // isBundledDirnamePlaceholder), so classify by the real project root instead — a global
+    // install under node_modules must resolve to "npm" even when $HOME happens to be a git repo.
+    const rawDir = location.currentDir ?? moduleDirname();
+    const currentDir = isBundledDirnamePlaceholder(rawDir) ? projectRoot : rawDir;
+    mode = resolveAutoUpdateMode(mode, { isGitRepo: isSourceCheckout(projectRoot), currentDir });
   }
 
   return {
