@@ -51,8 +51,7 @@ export default async function Layout({ children }: { children: ReactNode }) {
   return (
     <RootProvider
       theme={{
-        defaultTheme: "dark",
-        attribute: "class",
+        enabled: false,
       }}
       search={{
         options: {

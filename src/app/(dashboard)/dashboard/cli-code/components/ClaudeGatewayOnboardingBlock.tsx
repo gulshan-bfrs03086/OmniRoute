@@ -20,7 +20,7 @@ export default function ClaudeGatewayOnboardingBlock({ baseUrl }: { baseUrl: str
 
   const snippet = buildClaudeDiscoverySettingsSnippet({
     baseUrl,
-    apiKeyPlaceholder: t("ccOnboardingKeyPlaceholder"),
+    apiKeyPlaceholder: t.raw("ccOnboardingKeyPlaceholder"),
   });
 
   const handleCopy = async () => {
