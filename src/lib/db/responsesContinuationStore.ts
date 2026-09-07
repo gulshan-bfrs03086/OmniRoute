@@ -66,17 +66,27 @@ export function resolvePreviousResponseState(
   const db = getDbInstance();
   const row = db
     .prepare(
-      `SELECT artifact_relpath, api_key_id FROM call_logs
+      `SELECT artifact_relpath, api_key_id, video_content_removed FROM call_logs
        WHERE response_id = ? AND detail_state = 'ready'
        ORDER BY timestamp DESC LIMIT 1`
     )
-    .get(responseId) as { artifact_relpath: string | null; api_key_id: string | null } | undefined;
+    .get(responseId) as
+    | { artifact_relpath: string | null; api_key_id: string | null; video_content_removed: number }
+    | undefined;
 
   if (!row || !row.artifact_relpath) return null;
   // Tenant isolation: a response id is only ever handed back to the API key
   // that created it. A stored row with no api_key_id at all (no-log/legacy)
   // can never be resolved by any key -- fail closed rather than guess.
   if (!apiKeyId || row.api_key_id !== apiKeyId) return null;
+  // #12150 P2 surface 2: the persisted clientRawRequest snapshot on this row had
+  // its video transcript cues structurally redacted to [redacted-video-transcript]
+  // before storage (videoBridgeSnapshotRedaction, marker written by the call-log
+  // path). The stored input therefore no longer carries the client's real cue
+  // text -- reconstructing a continuation off it would forward the placeholder
+  // upstream as if it were genuine history. Fail closed so the client resends
+  // full history, exactly like a real previous_response_not_found.
+  if (row.video_content_removed === 1) return null;
 
   const { artifact, state } = readCallArtifact(row.artifact_relpath);
   if (state !== "ready" || !artifact?.pipeline) return null;
