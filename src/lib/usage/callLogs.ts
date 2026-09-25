@@ -12,7 +12,13 @@ import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitizatio
 import { getDbInstance } from "../db/core";
 import { getRequestDetailLogByCallLogId } from "../db/detailedLogs";
 import { shouldPersistToDisk } from "./migrations";
+import { updateRequestTokensById } from "./usageHistory";
 import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
+import {
+  seedPendingContinuationState,
+  clearPendingContinuationState,
+  type ContinuationPipeline,
+} from "../db/responsesContinuationStore";
 import {
   getLoggedInputTokens,
   getLoggedOutputTokens,
@@ -45,6 +51,7 @@ import {
   protectPipelinePayloads,
   buildRequestSummary,
   classifyCallLogError,
+  toStoredErrorType,
 } from "./callLogs/format";
 import {
   clearArtifactReference,
@@ -282,10 +289,49 @@ function extractAssistantMessage(responseBody: unknown): unknown {
 // non-zero reasoning tokens; otherwise we fall back to observed reasoning
 // content so "reasoned but metered 0" stays distinguishable. reasoning_chars is
 // a CHARACTER count, never a token count — it must not touch cost math.
+//
+// Encrypted-reasoning observability: an opaque Responses `reasoning` item
+// (`encrypted_content` / signature / format, no readable summary) overrides
+// every other source with 'encrypted'. The sink-side scan covers non-streaming
+// snapshots and batch-completed-without-added payloads; the streaming path
+// threads the same signal via `entry.reasoningMeta` (flag + wall-clock delta).
+// NEVER inspect or persist the opaque blob itself — presence only.
+function snapshotHasOpaqueReasoningItem(body: unknown): boolean {
+  const record =
+    body !== null && typeof body === "object" && !Array.isArray(body) ? (body as JsonRecord) : null;
+  if (!record) return false;
+  const outputs: unknown[] = [];
+  if (Array.isArray(record.output)) outputs.push(...record.output);
+  const nested =
+    record.response !== null &&
+    typeof record.response === "object" &&
+    !Array.isArray(record.response)
+      ? (record.response as JsonRecord)
+      : null;
+  if (nested && Array.isArray(nested.output)) outputs.push(...nested.output);
+  return outputs.some((item) => {
+    const itemRecord =
+      item !== null && typeof item === "object" && !Array.isArray(item)
+        ? (item as JsonRecord)
+        : null;
+    if (!itemRecord || itemRecord.type !== "reasoning") return false;
+    return (
+      (typeof itemRecord.encrypted_content === "string" &&
+        itemRecord.encrypted_content.length > 0) ||
+      itemRecord.signature !== undefined ||
+      itemRecord.format !== undefined
+    );
+  });
+}
+
 function resolveReasoningObservation(
   usageReasoning: number | null,
-  responseBody: unknown
+  responseBody: unknown,
+  streamMeta?: { encryptedSeen?: boolean } | null
 ): { source: string | null; chars: number | null } {
+  if (streamMeta?.encryptedSeen === true || snapshotHasOpaqueReasoningItem(responseBody)) {
+    return { source: "encrypted", chars: null };
+  }
   if (usageReasoning != null && usageReasoning > 0) {
     return { source: "usage", chars: null };
   }
@@ -446,6 +492,12 @@ function getLegacyInlineDetail(id: string) {
 
 async function saveCallLogOperation(entry: any): Promise<void> {
   try {
+    // Bind the DB instance up front, before any await (resolveAccountName,
+    // writeCallArtifactAsync). If the singleton is reset/closed while this
+    // operation awaits, the insert must target the instance this request
+    // started against — a closed handle fails into the catch below instead of
+    // silently writing into whatever database opened afterwards (#12780).
+    const db = getDbInstance();
     const apiKeyContext = getCallLogApiKeyContext();
     // `||` (not `??`): an empty-string apiKeyId/apiKeyName is "unattributed",
     // same as before this fallback existed — it must not be persisted verbatim
@@ -470,6 +522,26 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         );
     const protectedError = sanitizeErrorForLog(entry.error);
 
+    // Bridges the window before this row's own artifact write (queued below,
+    // async) lands with detail_state = 'ready': a client that fires its next
+    // turn immediately -- normal in a tight tool-calling loop -- can reach
+    // resolvePreviousResponseState before that write exists at all. Seeded
+    // synchronously, before any await, from the same protected pipeline
+    // payload the artifact will eventually hold (and the same
+    // videoContentRemoved/fail-closed rules), so it is available the instant
+    // this function is called. See responsesContinuationStore.ts.
+    if (typeof entry.responseId === "string" && entry.responseId.length > 0) {
+      seedPendingContinuationState(
+        entry.responseId,
+        apiKeyId,
+        // The store's own contract, not a looser restatement of it: the inline shape
+        // widened both fields to `unknown`, which does not assign to
+        // ContinuationPipeline's typed members (TS2345 under typecheck:core).
+        protectedPipelinePayloads as ContinuationPipeline | null,
+        Boolean(entry.videoContentRemoved)
+      );
+    }
+
     const account = await resolveAccountName(entry.connectionId || null);
     const rawProvider: string = entry.provider || "-";
     const rawRequestedModel: string | null = entry.requestedModel || null;
@@ -481,8 +553,55 @@ async function saveCallLogOperation(entry: any): Promise<void> {
     // #6187: usage-derived reasoning tokens stay UNCHANGED (cost math reads this),
     // while reasoning source/char-count are recorded separately for observability.
     const tokensReasoning = getReasoningTokensOrNull(entry.tokens);
-    const reasoningObservation = resolveReasoningObservation(tokensReasoning, entry.responseBody);
-    const errorType = classifyCallLogError(entry.status, entry.error, entry.provider);
+    const streamReasoningMeta =
+      entry.reasoningMeta !== null && typeof entry.reasoningMeta === "object"
+        ? (entry.reasoningMeta as { encryptedSeen?: boolean; durationMs?: unknown })
+        : null;
+    const reasoningObservation = resolveReasoningObservation(
+      tokensReasoning,
+      entry.responseBody,
+      streamReasoningMeta
+    );
+    // Encrypted-reasoning observability (nullable, additive): stream-side
+    // flag+duration win when present; the sink scan above already forced
+    // source='encrypted' for opaque snapshots (duration NULL there).
+    const streamDurationRaw = streamReasoningMeta?.durationMs;
+    const streamDurationMs =
+      typeof streamDurationRaw === "number" &&
+      Number.isFinite(streamDurationRaw) &&
+      streamDurationRaw >= 0 &&
+      streamDurationRaw <= 86_400_000
+        ? Math.round(streamDurationRaw)
+        : null;
+    const reasoningEncrypted =
+      streamReasoningMeta?.encryptedSeen === true || reasoningObservation.source === "encrypted"
+        ? 1
+        : null;
+    const reasoningDurationMs =
+      reasoningObservation.source === "encrypted" ? streamDurationMs : null;
+    const readEffortValue = (body: unknown): string | null => {
+      if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+      const record = body as Record<string, unknown>;
+      const direct = record.reasoning_effort;
+      if (typeof direct === "string" && direct.trim().length > 0) return direct;
+      const nested = record.reasoning;
+      if (nested !== null && typeof nested === "object" && !Array.isArray(nested)) {
+        const effort = (nested as Record<string, unknown>).effort;
+        if (typeof effort === "string" && effort.trim().length > 0) return effort;
+      }
+      return null;
+    };
+    const reasoningEffortRequested =
+      reasoningObservation.source === "encrypted"
+        ? readEffortValue(entry.clientRequestBody ?? entry.requestBody)
+        : null;
+    const reasoningEffortUpstream =
+      reasoningObservation.source === "encrypted"
+        ? readEffortValue(entry.upstreamRequestBody)
+        : null;
+    const errorType = toStoredErrorType(
+      classifyCallLogError(entry.status, entry.error, entry.provider)
+    );
     const logEntry = {
       id: typeof entry.id === "string" && entry.id.length > 0 ? entry.id : generateLogId(),
       timestamp: typeof entry.timestamp === "string" ? entry.timestamp : new Date().toISOString(),
@@ -503,6 +622,10 @@ async function saveCallLogOperation(entry: any): Promise<void> {
       tokensReasoning,
       reasoningSource: reasoningObservation.source,
       reasoningChars: reasoningObservation.chars,
+      reasoningDurationMs,
+      reasoningEffortRequested,
+      reasoningEffortUpstream,
+      reasoningEncrypted,
       tokensCompressed: entry.tokensCompressed != null ? toNumber(entry.tokensCompressed) : null,
       cacheSource: entry.cacheSource === "semantic" ? "semantic" : "upstream",
       requestType: entry.requestType || null,
@@ -563,7 +686,6 @@ async function saveCallLogOperation(entry: any): Promise<void> {
       }
     }
 
-    const db = getDbInstance();
     db.prepare(
       `
       INSERT INTO call_logs (
@@ -571,6 +693,8 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         account, connection_id, duration, tokens_in, tokens_out,
         tokens_cache_read, tokens_cache_creation, tokens_reasoning, tokens_compressed,
         reasoning_source, reasoning_chars,
+        reasoning_duration_ms, reasoning_effort_requested, reasoning_effort_upstream,
+        reasoning_encrypted,
         cache_source, request_type, source_format, target_format, api_key_id, api_key_name,
         combo_name, combo_step_id, combo_execution_key, error_summary, detail_state,
         artifact_relpath, artifact_size_bytes, artifact_sha256,
@@ -583,6 +707,8 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         @account, @connectionId, @duration, @tokensIn, @tokensOut,
         @tokensCacheRead, @tokensCacheCreation, @tokensReasoning, @tokensCompressed,
         @reasoningSource, @reasoningChars,
+        @reasoningDurationMs, @reasoningEffortRequested, @reasoningEffortUpstream,
+        @reasoningEncrypted,
         @cacheSource, @requestType, @sourceFormat, @targetFormat, @apiKeyId, @apiKeyName,
         @comboName, @comboStepId, @comboExecutionKey, @errorSummary, @detailState,
         @artifactRelPath, @artifactSizeBytes, @artifactSha256,
@@ -604,6 +730,12 @@ async function saveCallLogOperation(entry: any): Promise<void> {
       requestSummary,
     });
 
+    if (detailState === "ready" && typeof logEntry.responseId === "string") {
+      // The durable row is now authoritative; drop the bridge entry instead
+      // of letting it idle until its TTL.
+      clearPendingContinuationState(logEntry.responseId);
+    }
+
     scheduleCallLogRotation();
   } catch (error) {
     console.error(
@@ -614,6 +746,18 @@ async function saveCallLogOperation(entry: any): Promise<void> {
 }
 
 export function saveCallLog(entry: any): Promise<void> {
+  // Usage is also needed by the live dashboard when disk history is disabled.
+  // Retain only counters, never the request/response bodies from this entry.
+  if (entry?.tokens && typeof entry.tokens === "object") {
+    updateRequestTokensById(entry.pendingRequestId ?? entry.id, {
+      in: getLoggedInputTokens(entry.tokens),
+      out: getLoggedOutputTokens(entry.tokens),
+      cacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
+      cacheCreation: getPromptCacheCreationTokensOrNull(entry.tokens),
+      reasoning: getReasoningTokensOrNull(entry.tokens),
+      compressed: typeof entry.tokensCompressed === "number" ? entry.tokensCompressed : null,
+    });
+  }
   if (!shouldPersistToDisk || callLogSavesClosing) return Promise.resolve();
 
   const operation = saveCallLogOperation(entry);
@@ -874,4 +1018,43 @@ export async function exportCallLogsSince(since: string) {
     if (log) logs.push(log);
   }
   return logs;
+}
+
+/**
+ * Total number of call_logs rows with timestamp >= `since` — a cheap
+ * aggregate query, no row hydration. Used by /api/logs/export to report
+ * `totalAvailable` without paying the cost of hydrating every row (#13123).
+ */
+export function countCallLogsSince(since: string): number {
+  const db = getDbInstance();
+  const row = db
+    .prepare("SELECT COUNT(*) AS count FROM call_logs WHERE timestamp >= ?")
+    .get(since) as { count: number };
+  return row.count;
+}
+
+/**
+ * Streams up to `limit` hydrated call logs with timestamp >= `since`, most
+ * recent first, one at a time. Only fetches the id list eagerly (small — just
+ * strings) and bounds it with SQL LIMIT; each full log entry (which can
+ * include large request/response artifacts via `getCallLogById`) is only
+ * hydrated and held in memory long enough to be yielded (#13123: the previous
+ * `exportCallLogsSince()` + slice-after-fetch approach hydrated and buffered
+ * every matching row — including rows beyond the cap — before the row cap
+ * was ever applied, which is what left the peak V8 heap unchanged).
+ */
+export async function* iterateCallLogsSince(
+  since: string,
+  limit: number
+): AsyncGenerator<unknown, void, void> {
+  const db = getDbInstance();
+  const ids = db
+    .prepare("SELECT id FROM call_logs WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?")
+    .all(since, limit)
+    .map((row) => String((row as { id: string }).id));
+
+  for (const id of ids) {
+    const log = await getCallLogById(id);
+    if (log) yield log;
+  }
 }

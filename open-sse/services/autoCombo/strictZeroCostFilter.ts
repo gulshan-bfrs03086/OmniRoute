@@ -54,6 +54,7 @@ import {
   grantsFreeAccess,
   type FreeModelBudget,
 } from "@omniroute/open-sse/config/freeModelCatalog.ts";
+import { recordAutoExclusion } from "./autoEvaluationTrace";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
 
 export type FreeAccessStatus = "SAFE" | "EXHAUSTED" | "UNKNOWN";
@@ -282,7 +283,8 @@ export function classifyStrictZeroCostCandidate(
  */
 export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate>(
   pool: T[],
-  options: StrictZeroCostOptions
+  options: StrictZeroCostOptions,
+  traceInvocationId?: string
 ): T[] {
   if (!options.enabled) return pool;
 
@@ -298,6 +300,19 @@ export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate
     );
     if (safeConnectionIds.length === 0) {
       changed = true;
+      recordAutoExclusion(
+        traceInvocationId,
+        candidate,
+        "strict_zero_cost",
+        "auto_strict_zero_cost",
+        () =>
+          classifyStrictZeroCostCandidate(
+            candidate,
+            budgetEntry,
+            options.resolveFreeAccessState,
+            options
+          ).outcome
+      );
       continue;
     }
 
@@ -325,6 +340,31 @@ export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate
     }
   }
   return changed ? kept : pool;
+}
+
+/**
+ * How many candidates the STRICT filter drops outright (the same verdict it keeps on),
+ * and how many of those only for lack of a hard-stop guarantee.
+ */
+export function countStrictExclusions<T extends StrictZeroCostCandidate>(
+  pool: T[],
+  options: StrictZeroCostOptions
+): { excluded: number; noHardStop: number } {
+  let excluded = 0;
+  let noHardStop = 0;
+  for (const candidate of pool) {
+    const budgetEntry = findBudgetEntry(candidate, options.catalog);
+    const verdict = classifyStrictZeroCostCandidate(
+      candidate,
+      budgetEntry,
+      options.resolveFreeAccessState,
+      options
+    );
+    if (verdict.outcome === "safe") continue;
+    excluded++;
+    if (verdict.outcome === "no-hard-stop") noHardStop++;
+  }
+  return { excluded, noHardStop };
 }
 
 /**

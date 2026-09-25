@@ -3,13 +3,44 @@ import assert from "node:assert/strict";
 import plugin from "../src/index.js";
 
 interface CapturedCall {
-  kind: "catalog" | "integration";
+  kind: "provider" | "integration";
+}
+
+/**
+ * Wait until `read()` stops changing, then return the settled value.
+ *
+ * The plugin's optional tier lands asynchronously after a publish. Waiting for
+ * it with a fixed `sleep(5)` raced the work: under load the tier arrived after
+ * the sleep, so the *next* assertion counted its reload and read 2 where it
+ * expected 1. Polling until the value holds steady for a few consecutive turns
+ * ties the wait to the work instead of to the clock.
+ */
+async function settle<T>(read: () => T, quietTurns = 3, timeoutMs = 5000): Promise<T> {
+  const { setTimeout: sleep } = await import("node:timers/promises");
+  const deadline = Date.now() + timeoutMs;
+  let last = read();
+  let stable = 0;
+  while (stable < quietTurns && Date.now() < deadline) {
+    await sleep(5);
+    const current = read();
+    if (current === last) {
+      stable += 1;
+    } else {
+      last = current;
+      stable = 0;
+    }
+  }
+  return last;
 }
 
 interface FakeCtx {
   options: Record<string, unknown>;
-  catalog: {
-    transform: (cb: (draft: unknown) => unknown) => Promise<{ dispose: () => Promise<void> }>;
+  provider: {
+    transform: (cb: (editor: unknown) => unknown) => Promise<{ dispose: () => Promise<void> }>;
+    reload: () => Promise<void>;
+  };
+  model: {
+    transform: (cb: (editor: unknown) => unknown) => Promise<{ dispose: () => Promise<void> }>;
   };
   integration: {
     transform: (cb: (draft: unknown) => unknown) => Promise<{ dispose: () => Promise<void> }>;
@@ -19,9 +50,16 @@ interface FakeCtx {
 function fakeCtx(options: Record<string, unknown>, seen: CapturedCall[]): FakeCtx {
   return {
     options,
-    catalog: {
-      transform: (cb: (draft: unknown) => unknown) => {
-        seen.push({ kind: "catalog" });
+    provider: {
+      transform: (cb: (editor: unknown) => unknown) => {
+        seen.push({ kind: "provider" });
+        assert.equal(typeof cb, "function");
+        return Promise.resolve({ dispose: async () => {} });
+      },
+      reload: async () => {},
+    },
+    model: {
+      transform: (cb: (editor: unknown) => unknown) => {
         assert.equal(typeof cb, "function");
         return Promise.resolve({ dispose: async () => {} });
       },
@@ -57,7 +95,7 @@ describe("plugin-v2 entrypoint", () => {
     );
     assert.deepEqual(
       seen.map((s) => s.kind),
-      ["catalog", "integration"]
+      ["provider", "integration"]
     );
     const seen2: CapturedCall[] = [];
     const warns2: string[] = [];
@@ -80,29 +118,66 @@ describe("plugin-v2 entrypoint", () => {
     );
   });
 
-  it("registers transforms synchronously: captures exist without awaiting fetch", async () => {
-    const seen: CapturedCall[] = [];
-    const ctx = fakeCtx({ baseURL: "https://gw.example.com" }, seen);
-    const pending = (plugin as unknown as { setup: (ctx: FakeCtx) => Promise<void> }).setup(ctx);
-    assert.deepEqual(
-      seen.map((s) => s.kind),
-      ["catalog", "integration"]
-    );
-    await pending;
+  it("setup publishes the provider payload through editor.add", async () => {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown) => {
+      const href = String(url);
+      if (href.includes("/v1/models")) {
+        return {
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          json: async () => ({ data: [{ id: "m1" }] }),
+        };
+      }
+      return { ok: true, status: 200, statusText: "OK", json: async () => ({ combos: [] }) };
+    }) as typeof fetch;
+    const added: Array<{ info: Record<string, unknown>; models: unknown[] }> = [];
+    const ctx = {
+      options: { baseURL: "https://gw.example.com", providerId: "payload-add", apiKey: "k" },
+      provider: {
+        transform: (cb: (editor: { add: (input: unknown) => void }) => void) => {
+          cb({
+            add: (input: unknown) => {
+              added.push(input as { info: Record<string, unknown>; models: unknown[] });
+            },
+          });
+          return Promise.resolve({ dispose: async () => {} });
+        },
+        reload: async () => {},
+      },
+      model: {
+        transform: () => Promise.resolve({ dispose: async () => {} }),
+      },
+      integration: {
+        transform: () => Promise.resolve({ dispose: async () => {} }),
+      },
+    };
+    try {
+      await (plugin as unknown as { setup: (ctx: unknown) => Promise<void> }).setup(ctx);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+    assert.equal(added.length, 1);
+    assert.equal(added[0]?.info.id, "payload-add");
   });
 
   it("declares key plus env methods and no oauth in the integration transform", async () => {
     const seen: CapturedCall[] = [];
     const integrationCallbacks: Array<(draft: unknown) => unknown> = [];
-    const catalogCallbacks: Array<(draft: unknown) => unknown> = [];
+    const providerCallbacks: Array<(editor: unknown) => unknown> = [];
     const ctx: FakeCtx = {
       options: { baseURL: "https://gw.example.com", providerId: "omniroute" },
-      catalog: {
-        transform: (cb: (draft: unknown) => unknown) => {
-          seen.push({ kind: "catalog" });
-          catalogCallbacks.push(cb);
+      provider: {
+        transform: (cb: (editor: unknown) => unknown) => {
+          seen.push({ kind: "provider" });
+          providerCallbacks.push(cb);
           return Promise.resolve({ dispose: async () => {} });
         },
+        reload: async () => {},
+      },
+      model: {
+        transform: () => Promise.resolve({ dispose: async () => {} }),
       },
       integration: {
         transform: (cb: (draft: unknown) => unknown) => {
@@ -163,7 +238,6 @@ describe("plugin-v2 entrypoint", () => {
     const { mkdtempSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
-    const { setTimeout: sleep } = await import("node:timers/promises");
     const dir = mkdtempSync(join(tmpdir(), "omniroute-lazy-"));
     const prevDataDir = process.env.OPENCODE_DATA_DIR;
     process.env.OPENCODE_DATA_DIR = dir;
@@ -179,7 +253,6 @@ describe("plugin-v2 entrypoint", () => {
       return { ok: true, status: 200, statusText: "OK", json: async () => ({ data: ids }) };
     }) as typeof fetch;
     try {
-      const catalogCallbacks: Array<(draft: unknown) => Promise<void>> = [];
       let reloads = 0;
       const ctx = {
         options: {
@@ -188,14 +261,17 @@ describe("plugin-v2 entrypoint", () => {
           apiKey: "k-lazy",
           modelCacheTtlMs: 1,
         },
-        catalog: {
-          transform: (cb: (draft: unknown) => Promise<void>) => {
-            catalogCallbacks.push(cb);
+        provider: {
+          transform: (cb: (editor: { add: (input: unknown) => void }) => void) => {
+            cb({ add: () => {} });
             return Promise.resolve({ dispose: async () => {} });
           },
           reload: async () => {
             reloads += 1;
           },
+        },
+        model: {
+          transform: () => Promise.resolve({ dispose: async () => {} }),
         },
         integration: {
           transform: () => Promise.resolve({ dispose: async () => {} }),
@@ -211,30 +287,13 @@ describe("plugin-v2 entrypoint", () => {
       } finally {
         console.log = origLog;
       }
-      assert.equal(catalogCallbacks.length, 1);
-      const cb = catalogCallbacks[0] as (draft: unknown) => Promise<void>;
-      const draft = {
-        provider: { update: (_id: string, fn: (p: Record<string, unknown>) => void) => fn({}) },
-        model: {
-          update: (_pid: string, _mid: string, fn: (m: Record<string, unknown>) => void) => fn({}),
-        },
-      };
-      await cb(draft);
       assert.equal(reloads, 0, "the first publish sets the baseline, it does not reload");
       assert.equal(modelsCall, 1);
-      await sleep(5);
       // The optional tier lands after that first publish and brings combos and
       // the overlay with it — one reload, so the picker shows them without
       // waiting for the next refresh.
-      const afterFirstUpgrade = reloads;
+      const afterFirstUpgrade = await settle(() => reloads);
       assert.ok(afterFirstUpgrade <= 1, `at most one reload for the first upgrade, got ${reloads}`);
-      await cb(draft);
-      assert.equal(reloads, afterFirstUpgrade + 1, "a new model id reloads once");
-      assert.equal(modelsCall, 2);
-      await sleep(5);
-      await cb(draft);
-      assert.equal(reloads, afterFirstUpgrade + 1, "an identical run never reloads");
-      assert.equal(modelsCall, 3);
       if (prevDataDir === undefined) delete process.env.OPENCODE_DATA_DIR;
       else process.env.OPENCODE_DATA_DIR = prevDataDir;
     } finally {

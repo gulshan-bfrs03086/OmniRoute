@@ -79,15 +79,17 @@ async function executeModelUnit(args: {
   isModelAvailable?: IsModelAvailable;
   failoverBeforeRetry: unknown;
   effectiveComboStrategy: string;
+  fallbackAttempts: number;
 }): Promise<Response> {
   if (args.isModelAvailable) {
     const available = await args.isModelAvailable(args.unit.modelStr, args.unit);
-    if (!available) return errorResponse(503, `Model ${args.unit.modelStr} is unavailable`);
+    if (available !== true) return errorResponse(503, `Model ${args.unit.modelStr} is unavailable`);
   }
   return args.handleSingleModel(args.body, args.unit.modelStr, {
     ...args.unit,
     effectiveComboStrategy: args.effectiveComboStrategy,
     failoverBeforeRetry: args.failoverBeforeRetry,
+    fallbackAttempts: args.fallbackAttempts,
   });
 }
 
@@ -142,6 +144,7 @@ async function executeRuntimeUnit(args: {
   nesting: ComboNestingContext;
   failoverBeforeRetry: unknown;
   effectiveComboStrategy: string;
+  fallbackAttempts: number;
 }): Promise<Response> {
   if (args.unit.kind === "model") {
     return executeModelUnit({
@@ -151,6 +154,7 @@ async function executeRuntimeUnit(args: {
       isModelAvailable: args.isModelAvailable,
       failoverBeforeRetry: args.failoverBeforeRetry,
       effectiveComboStrategy: args.effectiveComboStrategy,
+      fallbackAttempts: args.fallbackAttempts,
     });
   }
   return executeComboRefUnit({
@@ -289,6 +293,7 @@ export async function executeRuntimeUnitCombo(args: {
         nesting: args.nesting,
         failoverBeforeRetry: args.config.failoverBeforeRetry,
         effectiveComboStrategy: effectiveStrategy,
+        fallbackAttempts: fallbackCount,
       });
       lastResponse = response;
       if (response.ok) {
@@ -312,7 +317,8 @@ export async function executeRuntimeUnitCombo(args: {
           unitClone,
           clientRequestedStream,
           args.log,
-          args.config.responseValidation as ResponseValidationConfig | undefined
+          args.config.responseValidation as ResponseValidationConfig | undefined,
+          args.signal
         );
         releaseQualityClone(unitClone, response, quality);
         if (quality.valid) {

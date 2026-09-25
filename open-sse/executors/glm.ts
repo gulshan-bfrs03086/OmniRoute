@@ -164,19 +164,6 @@ function isJsonResponse(response: Response): boolean {
   return (response.headers.get("content-type") || "").toLowerCase().includes("application/json");
 }
 
-async function translateJsonResponse(response: Response): Promise<Response> {
-  const parsed = await response.json().catch(() => null);
-  const translated = translateNonStreamingResponse(parsed, FORMATS.CLAUDE, FORMATS.OPENAI);
-  const headers = cloneHeaders(response.headers);
-  headers.set("content-type", "application/json");
-  headers.delete("content-length");
-  return new Response(JSON.stringify(translated), {
-    status: response.status,
-    statusText: response.statusText,
-    headers,
-  });
-}
-
 async function translateAnthropicJsonResponse(response: Response): Promise<Response> {
   const parsed = await response.json().catch(() => null);
   const translated = response.ok
@@ -216,6 +203,9 @@ function translateAnthropicJsonError(parsed: unknown): JsonRecord {
   };
 }
 
+/** 64 KB queue budget for GLM streaming (#12179, wired through in #12925). */
+const GLM_STREAM_BUFFER_BYTES = 65536;
+
 export function translateSseResponse(
   response: Response,
   provider: string,
@@ -223,8 +213,11 @@ export function translateSseResponse(
   suppressThinkClose: boolean = false
 ): Response {
   if (!response.body) return response;
-  // Helper has 15 parameters; a 16th positional (65536) was a TS2554 and
-  // never reached TransformStream. highWaterMark stays at the helper default.
+  // GLM is a high-throughput provider: a 64 KB queue budget keeps provider ->
+  // client pacing ahead of the model's emission rate. #12179 asked for this by
+  // passing a 16th positional the helper did not take (a TS2554 that never
+  // reached the TransformStream); the helper now accepts it as its last
+  // parameter, so the request finally takes effect (#12925).
   const transform = createSSETransformStreamWithLogger(
     FORMATS.CLAUDE,
     FORMATS.OPENAI,
@@ -238,7 +231,11 @@ export function translateSseResponse(
     null,
     null,
     false,
-    suppressThinkClose
+    suppressThinkClose,
+    undefined,
+    undefined,
+    undefined,
+    GLM_STREAM_BUFFER_BYTES
   );
   const headers = cloneHeaders(response.headers);
   headers.set("content-type", "text/event-stream");

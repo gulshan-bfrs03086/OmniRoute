@@ -36,6 +36,7 @@ const baseOpts = {
   rawModel: "m1",
   isTokenLimitBreach: false,
   allAccountsRateLimited: false,
+  requestScopedFailure: false,
   log,
   tag: "COMBO",
   exhaustedLogLevel: "info" as const,
@@ -683,6 +684,61 @@ test("sibling connection on the same provider is NOT skipped after a different c
   assert.ok(s.exhaustedConnections.has(`${failingTarget.provider}:${failingTarget.connectionId}`));
 });
 
+test("grok-cli 402 marks only the empty connection, not the whole provider", () => {
+  const s = sets();
+  const empty = target({
+    provider: "grok-cli",
+    connectionId: "qq-empty",
+    modelStr: "grok-cli/grok-4.6",
+  });
+  const sibling = target({
+    provider: "grok-cli",
+    connectionId: "hotmail-live",
+    modelStr: "grok-cli/grok-4.6",
+  });
+
+  const exhausted = applyComboTargetExhaustion(empty, {
+    ...baseOpts,
+    result: { status: 402 },
+    fallbackResult: { creditsExhausted: true, reason: "quota_exhausted" },
+    errorText: "Grok Build usage balance exhausted",
+    rawModel: "grok-4.6",
+    sets: s,
+  });
+
+  assert.equal(exhausted, true);
+  assert.ok(s.exhaustedConnections.has("grok-cli:qq-empty"));
+  assert.equal(
+    s.exhaustedProviders.has("grok-cli"),
+    false,
+    "sibling grok-cli accounts still have weekly credits"
+  );
+  assert.equal(s.exhaustedConnections.has("grok-cli:hotmail-live"), false);
+  void sibling;
+});
+
+for (const provider of ["grok-web", "xai-oauth"] as const) {
+  test(`${provider} 402 with empty body marks only that connection`, () => {
+    const s = sets();
+    const empty = target({
+      provider,
+      connectionId: "empty",
+      modelStr: `${provider}/m`,
+    });
+    const exhausted = applyComboTargetExhaustion(empty, {
+      ...baseOpts,
+      result: { status: 402 },
+      fallbackResult: {},
+      errorText: "",
+      rawModel: "m",
+      sets: s,
+    });
+    assert.equal(exhausted, true);
+    assert.ok(s.exhaustedConnections.has(`${provider}:empty`));
+    assert.equal(s.exhaustedProviders.has(provider), false);
+  });
+}
+
 test("401 carrying a real fingerprint signal still marks auth-level (exemption is 403-only)", () => {
   // Round 4 finding: Cloudflare 1010 is a 403-only CDN signal. A 401 invalid-credential
   // whose errorText carries a genuinely Cloudflare-keyed 1010 (error_code: 1010) must still
@@ -698,4 +754,85 @@ test("401 carrying a real fingerprint signal still marks auth-level (exemption i
   });
   assert.equal(exhausted, true, "a 401 with a fingerprint-looking body must still mark auth-level");
   assert.ok(s.exhaustedConnections.has("test-dedup-provider:conn-1"));
+});
+
+test("403 on per-model-quota provider does NOT mark connection or provider exhausted (#14136)", () => {
+  const s = sets();
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "gemini", connectionId: "gemini-conn-1" }),
+    {
+      ...baseOpts,
+      errorText: "User does not have permission to access model gemini-1.5-pro",
+      rawModel: "gemini-1.5-pro",
+      result: { status: 403 },
+      fallbackResult: { creditsExhausted: false },
+      sets: s,
+    }
+  );
+  assert.equal(exhausted, false, "403 on per-model-quota provider must not exhaust provider");
+  assert.equal(
+    s.exhaustedConnections.size,
+    0,
+    "403 on per-model-quota provider must not exhaust connection"
+  );
+  assert.equal(s.exhaustedProviders.size, 0);
+});
+
+test("403 on vertex with model-scoped permission denial does NOT exhaust connection (#14136)", () => {
+  const s = sets();
+  const vertexModelScopedError = JSON.stringify({
+    error: {
+      code: 403,
+      message: "Permission denied on resource",
+      details: [
+        {
+          reason: "IAM_PERMISSION_DENIED",
+          metadata: {
+            resource: "projects/test-p/locations/us-central1/publishers/google/models/gemini-ultra",
+          },
+        },
+      ],
+    },
+  });
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "vertex", connectionId: "vertex-conn-1" }),
+    {
+      ...baseOpts,
+      errorText: vertexModelScopedError,
+      rawModel: "gemini-ultra",
+      result: { status: 403 },
+      fallbackResult: { creditsExhausted: false },
+      sets: s,
+    }
+  );
+  assert.equal(exhausted, false);
+  assert.equal(s.exhaustedConnections.size, 0);
+});
+
+test("403 on vertex with connection-wide permission denial DOES exhaust connection (#14136)", () => {
+  const s = sets();
+  const vertexConnectionWideError = JSON.stringify({
+    error: {
+      code: 403,
+      message: "Cloud AI Platform API has not been used in project before or it is disabled.",
+      details: [
+        {
+          reason: "SERVICE_DISABLED",
+        },
+      ],
+    },
+  });
+  const exhausted = applyComboTargetExhaustion(
+    target({ provider: "vertex", connectionId: "vertex-conn-1" }),
+    {
+      ...baseOpts,
+      errorText: vertexConnectionWideError,
+      rawModel: "gemini-ultra",
+      result: { status: 403 },
+      fallbackResult: { creditsExhausted: false },
+      sets: s,
+    }
+  );
+  assert.equal(exhausted, true);
+  assert.ok(s.exhaustedConnections.has("vertex:vertex-conn-1"));
 });

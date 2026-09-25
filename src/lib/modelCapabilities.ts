@@ -17,7 +17,7 @@ import {
   getModelCapabilityOverride,
   getReasoningEffortsOverride,
 } from "@/lib/db/modelCapabilityOverrides";
-import { getCustomModelVisionOverride } from "@/lib/db/models";
+import { getCustomModelVisionOverride, getSyncedAvailableModelVision } from "@/lib/db/models";
 import type { ModelCapabilityResolutionSnapshot } from "@/lib/modelCapabilityResolutionSnapshot";
 import { resolveAudioCapability, resolveVideoCapability } from "@/lib/modelCapabilityModalities";
 
@@ -508,7 +508,8 @@ function resolveVisionCapability(
   modalitiesInput: string[],
   modalitiesOutput: string[],
   modelId?: string,
-  customVisionOverride?: boolean | null
+  customVisionOverride?: boolean | null,
+  syncedAvailableModelVision?: boolean | null
 ): boolean | null {
   const allModalities = [...modalitiesInput, ...modalitiesOutput].map((entry) =>
     String(entry).toLowerCase()
@@ -526,6 +527,14 @@ function resolveVisionCapability(
   // win for models the vendor documents as text-only. Beats every branch below so an
   // image request can never be routed to a blind model (#4071).
   if (isKnownTextOnlyDespiteSync(modelId)) return false;
+
+  // #14081: a custom OpenAI-compatible node's synced `syncedAvailableModels`
+  // row already made /v1/models report capabilities.vision:true for this
+  // model (buildSyncedCapabilities). Agree with that catalog verdict here too
+  // so the Vision Bridge guardrail does not reroute an image-capable model as
+  // text-only. Positive-only: this source is never `false`, so it can only
+  // add vision, never downgrade another source's verdict.
+  if (syncedAvailableModelVision === true) return true;
 
   if (typeof synced?.attachment === "boolean") {
     // #8250: models.dev sometimes ships attachment=false alongside image/video
@@ -845,14 +854,27 @@ export function getResolvedModelCapabilities(
   // fields keep using the non-leaf `spec` from getStaticSpec() above.
   const visionSpec = getVisionStaticSpec(resolved.model, resolved.rawModel);
 
-  // #9195: read the custom model's supportsVision override from the DB so the
-  // dashboard "Vision capable" toggle affects Combo routing.
+  // #9195 / #12758: keep the original provider&&model short-circuit. All
+  // three advertised id forms still parse to both halves; the matcher
+  // recovers the stored connection-id row via lookupKey / path leftover.
   const customVisionOverride =
     resolved.provider && resolved.model
       ? getCustomModelVisionOverride(
           resolved.provider,
           resolved.model,
-          snapshot?.customVisionOverrides
+          snapshot?.customVisionOverrides,
+          { lookupKey: resolved.lookupKey ?? resolved.rawModel ?? lookupKey }
+        )
+      : null;
+
+  // #14081: positive-only vision verdict from a custom node's synced
+  // `syncedAvailableModels` row, mirroring the catalog's buildSyncedCapabilities.
+  const syncedAvailableModelVision =
+    resolved.provider && resolved.model
+      ? getSyncedAvailableModelVision(
+          resolved.provider,
+          resolved.model,
+          snapshot?.syncedAvailableModelVision
         )
       : null;
 
@@ -863,7 +885,8 @@ export function getResolvedModelCapabilities(
     modalitiesInput,
     modalitiesOutput,
     lookupKey,
-    customVisionOverride
+    customVisionOverride,
+    syncedAvailableModelVision
   );
   const supportsAudio = resolveAudioCapability(spec, registryModel, modalitiesInput);
   const supportsVideo = resolveVideoCapability(spec, registryModel, modalitiesInput);

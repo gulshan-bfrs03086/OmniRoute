@@ -23,6 +23,7 @@ import { restoreNonStreamingToolNames } from "./passthroughToolNames.ts";
 import { extractUsageFromResponse } from "../usageExtractor.ts";
 import { sanitizeUsagePayloadForRequest } from "../../utils/usageTracking.ts";
 import { createErrorResult, formatProviderError } from "../../utils/error.ts";
+import { isLocalStreamLifecycleError } from "@/shared/utils/circuitBreaker";
 import { unwrapClinepassEnvelope } from "../../utils/clinepassEnvelope.ts";
 import { unwrapClineNonStreamingEnvelope } from "./clineResponseEnvelope.ts";
 import {
@@ -34,6 +35,7 @@ import {
 } from "../../services/modelFamilyFallback.ts";
 import { isEmptyContentResponse } from "../../services/errorClassifier.ts";
 import { FORMATS } from "../../translator/formats.ts";
+import { hasActiveClaudeThinking } from "../../utils/thinkingBudget.ts";
 
 /* -- exported types -------------------------------------------------------- */
 
@@ -86,8 +88,14 @@ export interface ProviderLegInput {
   effectiveModel?: string;
   translatedBody?: Record<string, unknown>;
   toolNameMap?: Map<string, string> | null;
+  customToolNames?: ReadonlySet<string>;
   requestToolIdentityMap?: Map<string, { namespace?: string; name: string }> | null;
   reasoningCacheScope?: string | null;
+  videoTranscriptSensitive?: boolean;
+  /** Normalized OpenAI transcript reported by translateRequest for Responses-API
+   *  targets (their body has `input`, not `messages`) — the replay-cache write
+   *  side must digest the same transcript the read side keyed plain turns on. */
+  reasoningReplayHistory?: unknown[] | null;
   clientHeaders?: Headers | Record<string, unknown> | null;
   isClaudeCodeCompatible?: boolean;
   sleep?: (ms: number) => Promise<void>;
@@ -232,7 +240,6 @@ function parseRetryAfterMs(response: Response): number | null {
   return null;
 }
 
-
 function finishOk(
   input: ProviderLegInput,
   params: {
@@ -280,13 +287,22 @@ function finishOk(
     provider: params.provider,
     model: params.model,
     requestBody: params.requestBody,
-    historyMessages: (input.translatedBody as { messages?: unknown[] } | null | undefined)
-      ?.messages,
+    historyMessages:
+      (input.translatedBody as { messages?: unknown[] } | null | undefined)?.messages ??
+      input.reasoningReplayHistory ??
+      null,
     responseToolNameMap,
+    customToolNames: input.customToolNames,
     requestToolIdentityMap: input.requestToolIdentityMap ?? null,
     reasoningCacheScope: input.reasoningCacheScope ?? null,
+    videoTranscriptSensitive: input.videoTranscriptSensitive,
     clientHeaders: input.clientHeaders ?? null,
     isClaudeCodeCompatible: input.isClaudeCodeCompatible ?? false,
+    // Same intent the streaming path computes in chatCore before building the
+    // SSE transform. Threading it here is what makes `stream:false` and
+    // `stream:true` agree on whether upstream reasoning may surface as a
+    // thinking block; the non-streaming converter used to never receive it.
+    requestedThinking: hasActiveClaudeThinking(input.sourceBody ?? {}),
     phase: input.phase === "initial" ? "final" : "intermediate",
   });
   const receipt = buildReceipt(input, {
@@ -435,6 +451,9 @@ export async function runNonStreamingProviderLeg(
               { passthrough: input.sourceFormat === "claude" }
             ),
             response: outcome.result.response,
+            rawMessage: outcome.result.rawMessage || outcome.result.error,
+            upstreamErrorBody: outcome.result.upstreamErrorBody,
+            upstreamHeaders: outcome.result.upstreamHeaders ?? outcome.result.response?.headers,
           },
           receipt,
           usage: outcome.providerUsage,
@@ -462,14 +481,22 @@ export async function runNonStreamingProviderLeg(
     ) {
       throw error;
     }
-    const failureStatus =
-      error instanceof Error && error.name === "AbortError"
-        ? 499
-        : error instanceof Error && error.name === "TimeoutError"
-          ? 504
-          : 502;
-    const failureMessage =
-      error instanceof Error
+    // `abort(reason)` can reject with a raw string that has no `name`/`status`, so
+    // `error.name === "AbortError"` is too narrow — that shape fell through to the 502
+    // provider-failure default (#7907). chatCore classified this through
+    // isLocalStreamLifecycleError before this leg took over the first send; mirror it.
+    const isRequestAborted = isLocalStreamLifecycleError(error);
+    const failureStatus = isRequestAborted
+      ? 499
+      : error instanceof Error && error.name === "TimeoutError"
+        ? 504
+        : 502;
+    // A client abort is not a provider failure: formatProviderError would stamp the raw
+    // upstream text as `[499]: <reason>`, leaking it to the client. chatCore has always
+    // normalized this to the fixed "Request aborted".
+    const failureMessage = isRequestAborted
+      ? "Request aborted"
+      : error instanceof Error
         ? formatProviderError(error, provider, currentModel, failureStatus)
         : "Provider request failed";
     const receipt = buildReceipt(input, {
@@ -750,6 +777,9 @@ export async function runNonStreamingProviderLeg(
       upstreamErrorType,
       { passthrough: sourceFormat === FORMATS.CLAUDE }
     );
+    errorResult.rawMessage = message;
+    errorResult.upstreamHeaders = providerResponse.headers;
+    errorResult.upstreamErrorBody = parsedErrorBody;
     return {
       kind: "error",
       result: errorResult as ChatCoreErrorResult,
@@ -941,7 +971,10 @@ export async function runNonStreamingProviderLeg(
   responseBody = unwrapClineNonStreamingEnvelope(provider, responseBody) as typeof responseBody;
 
   // -- Empty content -> family fallback (initial only) -------------------------
-  if (isEmptyContentResponse(responseBody)) {
+  // #14160: pass the provider so first-party APIs (antigravity) keep empty
+  // completions with a normal stop reason as valid 200s instead of synthetic
+  // 502s feeding model lockout.
+  if (isEmptyContentResponse(responseBody, { provider })) {
     const errMsg = "Provider returned empty content";
     if (allowModelFallback) {
       const triedModels = new Set<string>([currentModel]);
