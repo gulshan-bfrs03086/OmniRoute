@@ -209,3 +209,88 @@ test("reportPortInUse names the port, the owning pid, and how to resolve it", as
   assert.match(out, /omniroute stop/, "must tell the user how to free the port");
   assert.match(out, /--port/, "must offer running on a different port");
 });
+
+// Regression: on macOS/Linux `lsof -ti :<port>` exits with status 1 when NOTHING
+// listens, which execFile surfaces as a rejection, so findListeningPids() returns
+// null on every normal start (port free). The preflight then bind-probed, found
+// the port free, left busyPids === null and crashed on `busyPids.length` with
+// "Cannot read properties of null (reading 'length')" — `omniroute serve` could
+// not start at all. resolvePortOccupants() must always return an array.
+
+test("findListeningPids returns null when lsof exits 1 on a free port (the trigger)", async () => {
+  const noMatch = Object.assign(new Error("Command failed: lsof -ti :20128"), {
+    code: 1,
+    stdout: "",
+  });
+  const pids = await findListeningPids(20128, {
+    platform: "darwin",
+    execFileAsync: async () => {
+      throw noMatch;
+    },
+  });
+  assert.equal(pids, null);
+});
+
+test("resolvePortOccupants returns [] when discovery is null and the port is free", async () => {
+  const { resolvePortOccupants } = await import("../../bin/cli/utils/pid.mjs");
+  const occupants = await resolvePortOccupants(20128, {
+    findListeningPids: async () => null,
+    probePortFree: async () => true,
+  });
+  assert.deepEqual(occupants, [], "a free port must yield an empty list, never null");
+});
+
+test("resolvePortOccupants reports an unknown owner when discovery is null and the port is held", async () => {
+  const { resolvePortOccupants } = await import("../../bin/cli/utils/pid.mjs");
+  const occupants = await resolvePortOccupants(20128, {
+    findListeningPids: async () => null,
+    probePortFree: async () => false,
+  });
+  assert.deepEqual(occupants, [null]);
+});
+
+test("resolvePortOccupants bind-probes when discovery sees nothing", async () => {
+  const { resolvePortOccupants } = await import("../../bin/cli/utils/pid.mjs");
+  assert.deepEqual(
+    await resolvePortOccupants(20128, {
+      findListeningPids: async () => [],
+      probePortFree: async () => true,
+    }),
+    []
+  );
+  assert.deepEqual(
+    await resolvePortOccupants(20128, {
+      findListeningPids: async () => [],
+      probePortFree: async () => false,
+    }),
+    [null]
+  );
+});
+
+test("resolvePortOccupants passes discovered pids through without probing", async () => {
+  const { resolvePortOccupants } = await import("../../bin/cli/utils/pid.mjs");
+  let probed = false;
+  const occupants = await resolvePortOccupants(20128, {
+    findListeningPids: async () => [4242],
+    probePortFree: async () => {
+      probed = true;
+      return true;
+    },
+  });
+  assert.deepEqual(occupants, [4242]);
+  assert.equal(probed, false);
+});
+
+test("resolvePortOccupants against a real free port never returns null (end-to-end)", async () => {
+  const { resolvePortOccupants } = await import("../../bin/cli/utils/pid.mjs");
+  const probe = net.createServer();
+  await new Promise((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const { port } = probe.address();
+  await new Promise((r) => probe.close(r));
+  const occupants = await resolvePortOccupants(port);
+  assert.ok(Array.isArray(occupants), `expected an array, got ${JSON.stringify(occupants)}`);
+  assert.deepEqual(occupants, []);
+});

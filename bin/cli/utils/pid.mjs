@@ -286,3 +286,18 @@ async function isPortListening(port) {
   );
   return results.some((ok) => ok);
 }
+
+// Who holds `port`, as an array that is never null: discovered pids, [] when the
+// port is free, or [null] when it is held by an owner discovery could not name.
+// findListeningPids() returns null whenever discovery fails — including the
+// everyday case of `lsof -ti :<port>` exiting 1 because nothing listens — so the
+// caller must never read `.length` on its raw result; bind-probe instead.
+export async function resolvePortOccupants(port, deps = {}) {
+  const find = deps.findListeningPids || findListeningPids;
+  const probe = deps.probePortFree || probePortFree;
+  const pids = await find(port);
+  if (pids === null || pids.length === 0) {
+    return (await probe(port)) ? [] : [null];
+  }
+  return pids;
+}
