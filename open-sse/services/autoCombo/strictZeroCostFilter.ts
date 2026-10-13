@@ -54,6 +54,7 @@ import {
   grantsFreeAccess,
   type FreeModelBudget,
 } from "@omniroute/open-sse/config/freeModelCatalog.ts";
+import { FREE_TIER_TOS } from "@omniroute/open-sse/config/freeTierCatalog.ts";
 import { recordAutoExclusion } from "./autoEvaluationTrace";
 import { SYNTHETIC_NOAUTH_CONNECTION_ID } from "./resilienceCandidateFilter";
 
@@ -273,20 +274,32 @@ export function classifyStrictZeroCostCandidate(
 }
 
 /**
- * Pool-level filter, same off-by-default identity contract as
- * `filterPaidOnlyCandidates`. For a candidate that survives with a NARROWED
- * connection set (the multi-account case), the returned object has
- * `allowedConnectionIds` rewritten to exactly the SAFE subset — dispatch can
- * then never select a connection this filter didn't verify, because
- * `autoStrategy.ts` already enforces `allowedConnectionIds` as a hard
- * allowlist downstream (see the module docstring above).
+ * Pool-level filter with diagnosis, mirroring
+ * `filterPaidOnlyCandidatesWithDiagnosis`'s own shape. Carries the filtering
+ * logic; `filterStrictZeroCostCandidates` below is a thin wrapper over it.
+ * When the opt-in is off, or when nothing is excluded, the pool is returned
+ * unchanged (identity) with a null diagnosis — the same off-by-default
+ * identity contract as `filterPaidOnlyCandidates`. For a candidate that
+ * survives with a NARROWED connection set (the multi-account case), the
+ * returned object has `allowedConnectionIds` rewritten to exactly the SAFE
+ * subset — dispatch can then never select a connection this filter didn't
+ * verify, because `autoStrategy.ts` already enforces `allowedConnectionIds`
+ * as a hard allowlist downstream (see the module docstring above).
  */
-export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate>(
+export type StrictFilterDiagnosis = {
+  excluded: number;
+  noHardStop: number;
+  exhausted: number;
+  stateUnknown: number;
+  total: number;
+};
+
+export function filterStrictZeroCostCandidatesWithDiagnosis<T extends StrictZeroCostCandidate>(
   pool: T[],
   options: StrictZeroCostOptions,
   traceInvocationId?: string
-): T[] {
-  if (!options.enabled) return pool;
+): { pool: T[]; diagnosis: StrictFilterDiagnosis | null } {
+  if (!options.enabled) return { pool, diagnosis: null };
 
   const kept: T[] = [];
   let changed = false;
@@ -339,7 +352,17 @@ export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate
       kept.push({ ...candidate, allowedConnectionIds: safeConnectionIds });
     }
   }
-  return changed ? kept : pool;
+  if (!changed) return { pool, diagnosis: null };
+  const counts = countStrictExclusions(pool, options);
+  return { pool: kept, diagnosis: { ...counts, total: pool.length } };
+}
+
+export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate>(
+  pool: T[],
+  options: StrictZeroCostOptions,
+  traceInvocationId?: string
+): T[] {
+  return filterStrictZeroCostCandidatesWithDiagnosis(pool, options, traceInvocationId).pool;
 }
 
 /**
@@ -349,9 +372,11 @@ export function filterStrictZeroCostCandidates<T extends StrictZeroCostCandidate
 export function countStrictExclusions<T extends StrictZeroCostCandidate>(
   pool: T[],
   options: StrictZeroCostOptions
-): { excluded: number; noHardStop: number } {
+): { excluded: number; noHardStop: number; exhausted: number; stateUnknown: number } {
   let excluded = 0;
   let noHardStop = 0;
+  let exhausted = 0;
+  let stateUnknown = 0;
   for (const candidate of pool) {
     const budgetEntry = findBudgetEntry(candidate, options.catalog);
     const verdict = classifyStrictZeroCostCandidate(
@@ -363,8 +388,23 @@ export function countStrictExclusions<T extends StrictZeroCostCandidate>(
     if (verdict.outcome === "safe") continue;
     excluded++;
     if (verdict.outcome === "no-hard-stop") noHardStop++;
+    if (verdict.outcome === "exhausted") exhausted++;
+    if (verdict.outcome === "state-unknown") stateUnknown++;
   }
-  return { excluded, noHardStop };
+  return { excluded, noHardStop, exhausted, stateUnknown };
+}
+
+/**
+ * Pool-log detail for a STRICT drop: splits the excluded count into its causes so an
+ * operator can tell a proven-exhausted quota from a missing/unknown quota reading.
+ */
+export function describeStrictExclusions(
+  counts: Pick<
+    ReturnType<typeof countStrictExclusions>,
+    "noHardStop" | "exhausted" | "stateUnknown"
+  >
+): string {
+  return ` (no-hard-stop ${counts.noHardStop}, exhausted ${counts.exhausted}, state-unknown ${counts.stateUnknown})`;
 }
 
 /**
@@ -381,6 +421,8 @@ export function filterTosAvoidCandidates<T extends StrictZeroCostCandidate>(
   if (!excludeTosAvoid) return pool;
   return pool.filter((candidate) => {
     const budgetEntry = findBudgetEntry(candidate, catalog);
-    return budgetEntry?.tos !== "avoid";
+    // Newly discovered models still inherit the provider's curated verdict.
+    const tos = budgetEntry?.tos ?? FREE_TIER_TOS[candidate.provider];
+    return tos !== "avoid";
   });
 }

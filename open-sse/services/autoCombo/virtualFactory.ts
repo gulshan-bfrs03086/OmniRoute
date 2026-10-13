@@ -36,6 +36,7 @@ import { getSyncedAvailableModelsByConnection, getCustomModels } from "@/lib/db/
 import { filterPaidOnlyCandidatesWithDiagnosis } from "./paidModelFilter";
 import { filterLockoutCandidates, warnPoolDrop } from "./modelLockoutFilter";
 import { filterModelExposureCandidates } from "./modelExposureFilter";
+import { failClosedAutoConfig } from "./failClosedPool";
 import {
   filterSubscriptionOnlyCandidates,
   orderPoolByRung,
@@ -43,8 +44,8 @@ import {
 } from "./subscriptionLadder";
 import {
   classifyStrictZeroCostCandidate,
-  countStrictExclusions,
-  filterStrictZeroCostCandidates,
+  describeStrictExclusions,
+  filterStrictZeroCostCandidatesWithDiagnosis,
   filterTosAvoidCandidates,
   findBudgetEntry,
 } from "./strictZeroCostFilter";
@@ -795,16 +796,21 @@ export async function prepareVirtualAutoComboInputs(
       resolveFreeAccessState,
       ...strictZeroCostThresholds,
     };
-    const strictFilteredPool = filterStrictZeroCostCandidates(
+    const strict = filterStrictZeroCostCandidatesWithDiagnosis(
       pool,
       strictOptions,
       traceInvocationId
     );
-    if (strictFilteredPool !== pool) {
-      const s = countStrictExclusions(pool, strictOptions);
-      warnPoolDrop(log, "STRICT", s.excluded, pool.length, ` (no-hard-stop ${s.noHardStop})`);
-      pool = strictFilteredPool;
+    if (strict.diagnosis) {
+      warnPoolDrop(
+        log,
+        "STRICT",
+        strict.diagnosis.excluded,
+        pool.length,
+        describeStrictExclusions(strict.diagnosis)
+      );
     }
+    pool = strict.pool;
 
     // Annotate here rather than in the handler: this is where the thresholds and
     // `resolveFreeAccessState` already live. Doing it downstream would mean a second
@@ -970,7 +976,6 @@ export async function createVirtualAutoComboFromPrepared(
     candidatePool.length = 0;
     candidatePool.push(...overrideFilteredPool);
   }
-
   if (candidatePool.length === 0) {
     log.warn("AUTO", "No connected providers with valid credentials for virtual auto-combo");
     const emptyPool: string[] = [];
@@ -979,6 +984,7 @@ export async function createVirtualAutoComboFromPrepared(
       weights: { ...DEFAULT_WEIGHTS },
       explorationRate: 0.05,
       routerStrategy: "lkgp",
+      ...failClosedAutoConfig(spec),
     };
     return {
       id: `virtual-auto-${variant || "default"}`,
@@ -1084,7 +1090,6 @@ export async function createVirtualAutoComboFromPrepared(
       );
     }
   }
-
   let weights: ScoringWeights = { ...DEFAULT_WEIGHTS };
   let explorationRate = 0.05; // Default exploration rate
   let routerStrategy = "lkgp"; // All auto variants use LKGP
@@ -1162,8 +1167,8 @@ export async function createVirtualAutoComboFromPrepared(
     weights,
     explorationRate,
     routerStrategy,
+    ...failClosedAutoConfig(spec),
   };
-
   // Chaos mode fans out to the top-N most stable models in parallel. Panel size
   // is capped to keep a single IDE request from fanning out to dozens of providers;
   // operators can override via env var OMNIROUTE_CHAOS_MAX_PANEL (default 5).
