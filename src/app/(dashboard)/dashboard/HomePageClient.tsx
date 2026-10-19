@@ -486,6 +486,26 @@ export default function HomePageClient({ machineId }: HomePageClientProps) {
       );
     }
 
+    // Custom/compatible providers (provider_nodes ids such as openai-compatible-chat-<uuid>)
+    // are not in the static AI_PROVIDERS registry, so providerStats never covers them and
+    // their nodes always rendered idle. Derive their health from their own connections
+    // with the same connected/errored rules used for built-in providers.
+    const customHealthCounts = new Map<string, { connected: number; errors: number }>();
+    for (const conn of providerConnections) {
+      const canonical = normalizeProviderId(conn?.provider);
+      if (!canonical || healthByProvider.has(canonical)) continue;
+      const counts = customHealthCounts.get(canonical) ?? { connected: 0, errors: 0 };
+      if (isProviderConnectionConnected(conn)) counts.connected += 1;
+      else if (isProviderConnectionErrored(conn)) counts.errors += 1;
+      customHealthCounts.set(canonical, counts);
+    }
+    for (const [canonical, counts] of customHealthCounts) {
+      healthByProvider.set(
+        canonical,
+        counts.connected > 0 ? "active" : counts.errors > 0 ? "error" : "idle"
+      );
+    }
+
     const addProvider = (providerId?: string | null, name?: string) => {
       const rawProviderId = typeof providerId === "string" ? providerId.trim() : "";
       if (!rawProviderId) return;
